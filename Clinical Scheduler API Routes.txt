@@ -1,0 +1,499 @@
+// app/api/schedule/periods/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db/drizzle';
+import { schedulePeriods, teams, teamMembers } from '@/lib/db/schema';
+import { getUser } from '@/lib/db/queries';
+import { eq, and } from 'drizzle-orm';
+
+export async function GET(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Get user's team
+    const userTeam = await db.query.teamMembers.findFirst({
+      where: eq(teamMembers.userId, user.id),
+      with: { team: true }
+    });
+
+    if (!userTeam) {
+      return NextResponse.json({ error: 'User not part of any team' }, { status: 400 });
+    }
+
+    // Get schedule periods for the team
+    const periods = await db
+      .select()
+      .from(schedulePeriods)
+      .where(eq(schedulePeriods.teamId, userTeam.teamId))
+      .orderBy(schedulePeriods.startDate);
+
+    return NextResponse.json(periods);
+  } catch (error) {
+    console.error('Error fetching schedule periods:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Check if user is owner
+    if (user.role !== 'owner') {
+      return NextResponse.json({ error: 'Only owners can create schedule periods' }, { status: 403 });
+    }
+
+    const body = await request.json();
+    const { name, startDate, endDate, availabilityDeadline, teamId } = body;
+
+    // Validate user can create for this team
+    const userTeam = await db.query.teamMembers.findFirst({
+      where: and(eq(teamMembers.userId, user.id), eq(teamMembers.teamId, teamId))
+    });
+
+    if (!userTeam) {
+      return NextResponse.json({ error: 'Cannot create period for this team' }, { status: 403 });
+    }
+
+    const [newPeriod] = await db
+      .insert(schedulePeriods)
+      .values({
+        teamId,
+        name,
+        startDate,
+        endDate,
+        availabilityDeadline
+      })
+      .returning();
+
+    return NextResponse.json(newPeriod, { status: 201 });
+  } catch (error) {
+    console.error('Error creating schedule period:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// app/api/schedule/availability/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db/drizzle';
+import { availability, teamMembers } from '@/lib/db/schema';
+import { getUser } from '@/lib/db/queries';
+import { eq, and } from 'drizzle-orm';
+
+export async function GET(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const schedulePeriodId = searchParams.get('schedulePeriodId');
+    const userId = searchParams.get('userId') || user.id.toString();
+
+    if (!schedulePeriodId) {
+      return NextResponse.json({ error: 'Schedule period ID required' }, { status: 400 });
+    }
+
+    // Get availability for user
+    const userAvailability = await db
+      .select()
+      .from(availability)
+      .where(
+        and(
+          eq(availability.userId, parseInt(userId)),
+          eq(availability.schedulePeriodId, parseInt(schedulePeriodId))
+        )
+      );
+
+    return NextResponse.json(userAvailability);
+  } catch (error) {
+    console.error('Error fetching availability:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const body = await request.json();
+    const { schedulePeriodId, serviceId, date, preferenceType, priority, notes } = body;
+
+    // Insert or update availability
+    const [result] = await db
+      .insert(availability)
+      .values({
+        userId: user.id,
+        schedulePeriodId,
+        serviceId,
+        date,
+        preferenceType,
+        priority: priority || 3,
+        notes: notes || ''
+      })
+      .onConflictDoUpdate({
+        target: [availability.userId, availability.schedulePeriodId, availability.serviceId, availability.date],
+        set: {
+          preferenceType,
+          priority: priority || 3,
+          notes: notes || '',
+          submittedAt: new Date()
+        }
+      })
+      .returning();
+
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error('Error saving availability:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// app/api/schedule/generate/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db/drizzle';
+import { assignments, teamMembers } from '@/lib/db/schema';
+import { getUser } from '@/lib/db/queries';
+import { ClinicalScheduler } from '@/lib/scheduling/algorithm';
+import { eq, and } from 'drizzle-orm';
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Check if user is owner
+    if (user.role !== 'owner') {
+      return NextResponse.json({ error: 'Only owners can generate schedules' }, { status: 403 });
+    }
+
+    const body = await request.json();
+    const { schedulePeriodId, teamId, constraints } = body;
+
+    // Validate user can generate for this team
+    const userTeam = await db.query.teamMembers.findFirst({
+      where: and(eq(teamMembers.userId, user.id), eq(teamMembers.teamId, teamId))
+    });
+
+    if (!userTeam) {
+      return NextResponse.json({ error: 'Cannot generate schedule for this team' }, { status: 403 });
+    }
+
+    // Clear existing assignments for this period (if any)
+    await db
+      .delete(assignments)
+      .where(eq(assignments.schedulePeriodId, schedulePeriodId));
+
+    // Generate schedule using algorithm
+    const scheduler = new ClinicalScheduler(teamId, schedulePeriodId, constraints);
+    const result = await scheduler.generateSchedule();
+
+    // Save assignments to database
+    if (result.assignments.length > 0) {
+      await db.insert(assignments).values(
+        result.assignments.map(assignment => ({
+          ...assignment,
+          assignedBy: user.id
+        }))
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      assignmentsCreated: result.assignments.length,
+      warnings: result.warnings,
+      unassignedSlots: result.unassignedSlots,
+      satisfactionScore: result.score
+    });
+  } catch (error) {
+    console.error('Error generating schedule:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// app/api/schedule/assignments/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db/drizzle';
+import { assignments, users, services, teamMembers } from '@/lib/db/schema';
+import { getUser } from '@/lib/db/queries';
+import { eq, and, gte, lte } from 'drizzle-orm';
+
+export async function GET(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const schedulePeriodId = searchParams.get('schedulePeriodId');
+    const startDate = searchParams.get('startDate');
+    const endDate = searchParams.get('endDate');
+    const userId = searchParams.get('userId');
+
+    let query = db
+      .select({
+        assignment: assignments,
+        user: users,
+        service: services
+      })
+      .from(assignments)
+      .innerJoin(users, eq(assignments.userId, users.id))
+      .innerJoin(services, eq(assignments.serviceId, services.id));
+
+    // Apply filters
+    const conditions = [];
+    
+    if (schedulePeriodId) {
+      conditions.push(eq(assignments.schedulePeriodId, parseInt(schedulePeriodId)));
+    }
+    
+    if (startDate) {
+      conditions.push(gte(assignments.date, startDate));
+    }
+    
+    if (endDate) {
+      conditions.push(lte(assignments.date, endDate));
+    }
+    
+    if (userId) {
+      conditions.push(eq(assignments.userId, parseInt(userId)));
+    }
+
+    if (conditions.length > 0) {
+      query = query.where(and(...conditions));
+    }
+
+    const result = await query.orderBy(assignments.date);
+
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error('Error fetching assignments:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// app/api/schedule/swaps/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db/drizzle';
+import { swapRequests, assignments, users } from '@/lib/db/schema';
+import { getUser } from '@/lib/db/queries';
+import { SwapSuggestionEngine } from '@/lib/scheduling/algorithm';
+import { eq, and } from 'drizzle-orm';
+
+export async function GET(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Get swap requests for user
+    const userSwapRequests = await db
+      .select({
+        swapRequest: swapRequests,
+        requester: users,
+        targetUser: users
+      })
+      .from(swapRequests)
+      .innerJoin(users, eq(swapRequests.requesterId, users.id))
+      .leftJoin(users, eq(swapRequests.targetUserId, users.id))
+      .where(
+        and(
+          eq(swapRequests.requesterId, user.id),
+          eq(swapRequests.status, 'pending')
+        )
+      );
+
+    return NextResponse.json(userSwapRequests);
+  } catch (error) {
+    console.error('Error fetching swap requests:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const body = await request.json();
+    const { requesterAssignmentId, targetAssignmentId, reason } = body;
+
+    // Validate the requester owns the assignment
+    const [requesterAssignment] = await db
+      .select()
+      .from(assignments)
+      .where(eq(assignments.id, requesterAssignmentId))
+      .limit(1);
+
+    if (!requesterAssignment || requesterAssignment.userId !== user.id) {
+      return NextResponse.json({ error: 'Invalid assignment' }, { status: 400 });
+    }
+
+    // Get target assignment info
+    const [targetAssignment] = await db
+      .select()
+      .from(assignments)
+      .where(eq(assignments.id, targetAssignmentId))
+      .limit(1);
+
+    if (!targetAssignment) {
+      return NextResponse.json({ error: 'Target assignment not found' }, { status: 400 });
+    }
+
+    // Create swap request
+    const [newSwapRequest] = await db
+      .insert(swapRequests)
+      .values({
+        requesterId: user.id,
+        requesterAssignmentId,
+        targetUserId: targetAssignment.userId,
+        targetAssignmentId,
+        swapDetails: {
+          type: '2-way',
+          participants: [
+            { userId: user.id, assignmentId: requesterAssignmentId },
+            { userId: targetAssignment.userId, assignmentId: targetAssignmentId }
+          ]
+        },
+        reason,
+        status: 'pending'
+      })
+      .returning();
+
+    return NextResponse.json(newSwapRequest, { status: 201 });
+  } catch (error) {
+    console.error('Error creating swap request:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// app/api/schedule/swaps/suggestions/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { getUser } from '@/lib/db/queries';
+import { SwapSuggestionEngine } from '@/lib/scheduling/algorithm';
+
+export async function GET(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const assignmentId = searchParams.get('assignmentId');
+
+    if (!assignmentId) {
+      return NextResponse.json({ error: 'Assignment ID required' }, { status: 400 });
+    }
+
+    // Get user's team ID (simplified - you'd get this from the database)
+    const teamId = 1; // This should come from your team lookup
+
+    const swapEngine = new SwapSuggestionEngine(teamId);
+    const suggestions = await swapEngine.suggestSwaps(parseInt(assignmentId));
+
+    return NextResponse.json(suggestions);
+  } catch (error) {
+    console.error('Error getting swap suggestions:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// app/api/schedule/services/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db/drizzle';
+import { services, teamMembers } from '@/lib/db/schema';
+import { getUser } from '@/lib/db/queries';
+import { eq, and } from 'drizzle-orm';
+
+export async function GET(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Get user's team
+    const userTeam = await db.query.teamMembers.findFirst({
+      where: eq(teamMembers.userId, user.id),
+      with: { team: true }
+    });
+
+    if (!userTeam) {
+      return NextResponse.json({ error: 'User not part of any team' }, { status: 400 });
+    }
+
+    // Get services for the team
+    const teamServices = await db
+      .select()
+      .from(services)
+      .where(and(eq(services.teamId, userTeam.teamId), eq(services.isActive, true)))
+      .orderBy(services.name);
+
+    return NextResponse.json(teamServices);
+  } catch (error) {
+    console.error('Error fetching services:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    // Check if user is owner
+    if (user.role !== 'owner') {
+      return NextResponse.json({ error: 'Only owners can create services' }, { status: 403 });
+    }
+
+    const body = await request.json();
+    const { name, description, serviceType, color, minStaffRequired, maxStaffAllowed, startTime, endTime, teamId } = body;
+
+    // Validate user can create for this team
+    const userTeam = await db.query.teamMembers.findFirst({
+      where: and(eq(teamMembers.userId, user.id), eq(teamMembers.teamId, teamId))
+    });
+
+    if (!userTeam) {
+      return NextResponse.json({ error: 'Cannot create service for this team' }, { status: 403 });
+    }
+
+    const [newService] = await db
+      .insert(services)
+      .values({
+        teamId,
+        name,
+        description,
+        serviceType,
+        color: color || '#3B82F6',
+        minStaffRequired: minStaffRequired || 1,
+        maxStaffAllowed: maxStaffAllowed || 1,
+        startTime,
+        endTime
+      })
+      .returning();
+
+    return NextResponse.json(newService, { status: 201 });
+  } catch (error) {
+    console.error('Error creating service:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}

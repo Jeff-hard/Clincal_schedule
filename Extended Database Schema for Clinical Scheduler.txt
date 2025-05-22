@@ -1,0 +1,256 @@
+// lib/db/schema.ts - Extended schema for clinical scheduler
+
+import {
+  pgTable,
+  serial,
+  varchar,
+  text,
+  timestamp,
+  integer,
+  boolean,
+  date,
+  time,
+  pgEnum,
+  json,
+  decimal
+} from 'drizzle-orm/pg-core';
+import { relations } from 'drizzle-orm';
+
+// Existing schemas remain the same...
+// Adding new enums and tables for scheduling
+
+export const serviceTypeEnum = pgEnum('service_type', ['weekday', 'weekend', 'holiday', 'call']);
+export const assignmentStatusEnum = pgEnum('assignment_status', ['scheduled', 'pending', 'completed', 'cancelled']);
+export const preferenceTypeEnum = pgEnum('preference_type', ['prefer', 'available', 'unavailable', 'emergency_only']);
+export const swapStatusEnum = pgEnum('swap_status', ['pending', 'approved', 'rejected', 'completed']);
+
+// Services/Rotations table
+export const services = pgTable('services', {
+  id: serial('id').primaryKey(),
+  teamId: integer('team_id').notNull().references(() => teams.id),
+  name: varchar('name', { length: 100 }).notNull(),
+  description: text('description'),
+  serviceType: serviceTypeEnum('service_type').notNull(),
+  color: varchar('color', { length: 7 }).default('#3B82F6'), // Hex color for UI
+  minStaffRequired: integer('min_staff_required').default(1),
+  maxStaffAllowed: integer('max_staff_allowed').default(1),
+  startTime: time('start_time'),
+  endTime: time('end_time'),
+  isActive: boolean('is_active').default(true),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+});
+
+// Schedule periods (rotations, blocks, etc.)
+export const schedulePeriods = pgTable('schedule_periods', {
+  id: serial('id').primaryKey(),
+  teamId: integer('team_id').notNull().references(() => teams.id),
+  name: varchar('name', { length: 100 }).notNull(),
+  startDate: date('start_date').notNull(),
+  endDate: date('end_date').notNull(),
+  isPublished: boolean('is_published').default(false),
+  isLocked: boolean('is_locked').default(false),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+});
+
+// User preferences for scheduling
+export const userPreferences = pgTable('user_preferences', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').notNull().references(() => users.id),
+  teamId: integer('team_id').notNull().references(() => teams.id),
+  
+  // General preferences
+  maxConsecutiveDays: integer('max_consecutive_days').default(7),
+  maxWeekendsPerMonth: integer('max_weekends_per_month').default(1),
+  preferBackToBackWeeks: boolean('prefer_back_to_back_weeks').default(false),
+  preferTwoWeeksInRow: boolean('prefer_two_weeks_in_row').default(false),
+  
+  // Custom preferences as JSON for flexibility
+  customPreferences: json('custom_preferences').$type<{
+    preferredServices?: string[];
+    blackoutDates?: string[];
+    preferredDaysOff?: number[]; // 0-6 for days of week
+    maxShiftsPerWeek?: number;
+    minRestHoursBetweenShifts?: number;
+  }>(),
+  
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+});
+
+// Availability submissions
+export const availability = pgTable('availability', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').notNull().references(() => users.id),
+  schedulePeriodId: integer('schedule_period_id').notNull().references(() => schedulePeriods.id),
+  serviceId: integer('service_id').notNull().references(() => services.id),
+  date: date('date').notNull(),
+  preferenceType: preferenceTypeEnum('preference_type').notNull(),
+  priority: integer('priority').default(3), // 1-5 scale
+  notes: text('notes'),
+  submittedAt: timestamp('submitted_at').notNull().defaultNow(),
+});
+
+// Actual assignments
+export const assignments = pgTable('assignments', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').notNull().references(() => users.id),
+  serviceId: integer('service_id').notNull().references(() => services.id),
+  schedulePeriodId: integer('schedule_period_id').notNull().references(() => schedulePeriods.id),
+  date: date('date').notNull(),
+  status: assignmentStatusEnum('status').default('scheduled'),
+  isCallDay: boolean('is_call_day').default(false),
+  assignedBy: integer('assigned_by').references(() => users.id),
+  assignedAt: timestamp('assigned_at').notNull().defaultNow(),
+  notes: text('notes'),
+});
+
+// Swap requests
+export const swapRequests = pgTable('swap_requests', {
+  id: serial('id').primaryKey(),
+  requesterId: integer('requester_id').notNull().references(() => users.id),
+  requesterAssignmentId: integer('requester_assignment_id').notNull().references(() => assignments.id),
+  
+  // For 2-way swaps
+  targetUserId: integer('target_user_id').references(() => users.id),
+  targetAssignmentId: integer('target_assignment_id').references(() => assignments.id),
+  
+  // For 3-way swaps (stored as JSON for complexity)
+  swapDetails: json('swap_details').$type<{
+    type: '2-way' | '3-way';
+    participants?: {
+      userId: number;
+      assignmentId: number;
+      newAssignmentId?: number;
+    }[];
+  }>(),
+  
+  status: swapStatusEnum('status').default('pending'),
+  reason: text('reason'),
+  adminNotes: text('admin_notes'),
+  
+  requestedAt: timestamp('requested_at').notNull().defaultNow(),
+  respondedAt: timestamp('responded_at'),
+  respondedBy: integer('responded_by').references(() => users.id),
+});
+
+// Scheduling constraints and rules
+export const schedulingRules = pgTable('scheduling_rules', {
+  id: serial('id').primaryKey(),
+  teamId: integer('team_id').notNull().references(() => teams.id),
+  name: varchar('name', { length: 100 }).notNull(),
+  ruleType: varchar('rule_type', { length: 50 }).notNull(), // 'max_consecutive', 'min_rest', etc.
+  ruleConfig: json('rule_config').$type<{
+    maxConsecutiveDays?: number;
+    minRestHours?: number;
+    maxWeekendsPerMonth?: number;
+    requiredServices?: string[];
+    weight?: number; // For rule priority in algorithm
+  }>(),
+  isActive: boolean('is_active').default(true),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+});
+
+// Relations
+export const servicesRelations = relations(services, ({ one, many }) => ({
+  team: one(teams, {
+    fields: [services.teamId],
+    references: [teams.id],
+  }),
+  availability: many(availability),
+  assignments: many(assignments),
+}));
+
+export const schedulePeriodsRelations = relations(schedulePeriods, ({ one, many }) => ({
+  team: one(teams, {
+    fields: [schedulePeriods.teamId],
+    references: [teams.id],
+  }),
+  availability: many(availability),
+  assignments: many(assignments),
+}));
+
+export const userPreferencesRelations = relations(userPreferences, ({ one }) => ({
+  user: one(users, {
+    fields: [userPreferences.userId],
+    references: [users.id],
+  }),
+  team: one(teams, {
+    fields: [userPreferences.teamId],
+    references: [teams.id],
+  }),
+}));
+
+export const availabilityRelations = relations(availability, ({ one }) => ({
+  user: one(users, {
+    fields: [availability.userId],
+    references: [users.id],
+  }),
+  service: one(services, {
+    fields: [availability.serviceId],
+    references: [services.id],
+  }),
+  schedulePeriod: one(schedulePeriods, {
+    fields: [availability.schedulePeriodId],
+    references: [schedulePeriods.id],
+  }),
+}));
+
+export const assignmentsRelations = relations(assignments, ({ one }) => ({
+  user: one(users, {
+    fields: [assignments.userId],
+    references: [users.id],
+  }),
+  service: one(services, {
+    fields: [assignments.serviceId],
+    references: [services.id],
+  }),
+  schedulePeriod: one(schedulePeriods, {
+    fields: [assignments.schedulePeriodId],
+    references: [schedulePeriods.id],
+  }),
+  assignedBy: one(users, {
+    fields: [assignments.assignedBy],
+    references: [users.id],
+  }),
+}));
+
+export const swapRequestsRelations = relations(swapRequests, ({ one }) => ({
+  requester: one(users, {
+    fields: [swapRequests.requesterId],
+    references: [users.id],
+  }),
+  targetUser: one(users, {
+    fields: [swapRequests.targetUserId],
+    references: [users.id],
+  }),
+  requesterAssignment: one(assignments, {
+    fields: [swapRequests.requesterAssignmentId],
+    references: [assignments.id],
+  }),
+  targetAssignment: one(assignments, {
+    fields: [swapRequests.targetAssignmentId],
+    references: [assignments.id],
+  }),
+  respondedByUser: one(users, {
+    fields: [swapRequests.respondedBy],
+    references: [users.id],
+  }),
+}));
+
+// Types
+export type Service = typeof services.$inferSelect;
+export type NewService = typeof services.$inferInsert;
+export type SchedulePeriod = typeof schedulePeriods.$inferSelect;
+export type NewSchedulePeriod = typeof schedulePeriods.$inferInsert;
+export type UserPreferences = typeof userPreferences.$inferSelect;
+export type NewUserPreferences = typeof userPreferences.$inferInsert;
+export type Availability = typeof availability.$inferSelect;
+export type NewAvailability = typeof availability.$inferInsert;
+export type Assignment = typeof assignments.$inferSelect;
+export type NewAssignment = typeof assignments.$inferInsert;
+export type SwapRequest = typeof swapRequests.$inferSelect;
+export type NewSwapRequest = typeof swapRequests.$inferInsert;
+export type SchedulingRule = typeof schedulingRules.$inferSelect;
+export type NewSchedulingRule = typeof schedulingRules.$inferInsert;
